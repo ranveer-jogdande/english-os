@@ -615,6 +615,7 @@ async function geminiRaw(model, body){
     if(r.status===404 || /not found|not supported|is not available|deprecated/i.test(msg)) throw {code:"model_unavailable", message:msg};
     if(r.status===400 && /api key/i.test(msg) || st==="INVALID_ARGUMENT"&&/key/i.test(msg) || r.status===401) throw {code:"bad_key", message:"That Gemini key isn't valid. Check it in Settings."};
     if(r.status===403) throw {code:"forbidden", message:msg};
+    if(r.status===503 || r.status===500 || r.status===502 || /high demand|overloaded|unavailable|try again later/i.test(msg)) throw {code:"overloaded", message:msg};
     throw {code:"http_"+r.status, message:msg};
   }
   const c=(j.candidates||[])[0];
@@ -644,10 +645,11 @@ async function gemini({contents, system, json=false, quick=false, maxTokens=8192
         }catch(e){
           lastErr=e;
           if(e.code==="rate_limited" && attempt===0 && e.wait<=20){ toast(`Free-tier limit reached; retrying in ${e.wait}s…`); await new Promise(r=>setTimeout(r,e.wait*1000)); continue; }
+          if(e.code==="overloaded" && attempt===0){ await new Promise(r=>setTimeout(r,1500)); continue; }
           break;
         }
       }
-      if(lastErr && !["model_unavailable","rate_limited","forbidden"].includes(lastErr.code)) break;
+      if(lastErr && !["model_unavailable","rate_limited","forbidden","overloaded","http_500","http_502","http_503","empty"].includes(lastErr.code)) break;
     }
     GEM.lastError = lastErr ? lastErr.message : "";
     if(lastErr && lastErr.code==="bad_key"){ AI.state="error"; paintStatus(); }
@@ -667,7 +669,7 @@ async function setKey(k){
   k=String(k||"").trim(); GEM.key=k; lsSet(KEY_LS,k); GEM.working=""; lsSet(MODEL_LS,"");
   if(!k){ AI.state="off"; paintStatus(); render(); return false; }
   try{ await gemini({contents:toContents("Reply with the single word: ready"), maxTokens:256}); AI.state="on"; toast(`Connected to ${GEM.working}.`); Daily.failed=null; setTimeout(()=>ensureDaily(),300); }
-  catch(e){ AI.state = e.code==="bad_key"?"error":"on"; toast(e.code==="bad_key"?e.message:e.code==="rate_limited"?"Key saved. Google says the free limit is reached right now; try again in a minute.":"Key saved, but the test failed: "+(e.message||e.code).slice(0,120)); }
+  catch(e){ AI.state = e.code==="bad_key"?"error":"on"; toast(e.code==="bad_key"?e.message:e.code==="overloaded"?"Key saved. Google's free models are busy right now; the app will retry automatically when you practise.":e.code==="rate_limited"?"Key saved. Google says the free limit is reached right now; try again in a minute.":"Key saved, but the test failed: "+(e.message||e.code).slice(0,120)); }
   paintStatus(); render(); return AI.state==="on";
 }
 function initServices(){ AI.state = GEM.key ? "on" : "off"; paintStatus(); }
@@ -792,7 +794,7 @@ const Voice = {
         const el=document.getElementById(target);
         if(el){ el.value = (el.value.trim()?el.value.trimEnd()+" ":"") + res.transcript.trim(); el.dispatchEvent(new Event("input",{bubbles:true})); }
         opts.onDone && opts.onDone(res);
-      }catch(e){ toast(e.code==="rate_limited"?"Google's free limit was reached. Wait a minute and record again.":e.code==="no_ai"||e.code==="bad_key"?(e.message||"Check your Gemini key in Settings."):"Couldn't analyse the recording: "+String(e.message||e.code||e).slice(0,100)); opts.onError&&opts.onError(e); }
+      }catch(e){ toast(e.code==="rate_limited"?"Google's free limit was reached. Wait a minute and record again.":e.code==="overloaded"?"All of Google's free models are busy right now. Please record that again in a minute.":e.code==="no_ai"||e.code==="bad_key"?(e.message||"Check your Gemini key in Settings."):"Couldn't analyse the recording: "+String(e.message||e.code||e).slice(0,100)); opts.onError&&opts.onError(e); }
       finally{ this.busy=false; this.pending=null; paintMic(); }
     })();
     return this.pending;
@@ -1201,7 +1203,7 @@ async function ensureDaily(force){
     if(needWords){ const n = dueWords().length>8 ? 3 : 5; S.dayWords[t] = await genWords(n); save(); repaintForDaily(); }
     if(needPack){ const p=await genPack(); if(!p.listening && !p.shadowing && !(p.free_prompts&&p.free_prompts.length)) throw {code:"bad_pack"}; S.daily ||= {}; S.daily[t]=p; const ks=Object.keys(S.daily).sort(); ks.slice(0,Math.max(0,ks.length-3)).forEach(k=>delete S.daily[k]); hydrateContent(); if(!D().blocks.length) buildPlan(true); save(); }
   }catch(e){
-    Daily.failed=t; Daily.msg = e.code==="rate_limited"?"Google's free limit is reached right now; using the built-in library today.":"Couldn't create today's new content; using the built-in library.";
+    Daily.failed=t; Daily.msg = e.code==="overloaded"?"Google's free models are busy right now. Tap Try again in a few minutes.":e.code==="rate_limited"?"Google's free limit is reached right now; using the built-in library today.":"Couldn't create today's new content; using the built-in library.";
     if(needWords && !S.dayWords[t]){ const pool=WORDS.filter(x=>!V(x.w).introduced); S.dayWords[t]=pool.slice(0,5).map(x=>x.w); save(); }
   }
   Daily.running=false; repaintForDaily();
@@ -1429,7 +1431,7 @@ function keySetupHTML(compact){
    ${compact?"":`<p class="muted">English OS uses Google's free Gemini tier to understand your speech, check pronunciation and play conversation partners. It runs from your own free key, so nobody pays anything.</p>`}
    <ol style="margin:0;padding-left:20px;display:flex;flex-direction:column;gap:4px">
     <li>Open <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> and sign in with your Google account.</li>
-    <li>Tap <b>Create API key</b> and copy it (it starts with <span class="mono">AIza</span>).</li>
+    <li>Tap <b>Create API key</b> and copy it (it starts with <span class="mono">AIza</span> or <span class="mono">AQ.</span>).</li>
     <li>Paste it here.</li></ol>
    <div class="row" style="flex-wrap:nowrap"><input type="text" id="keyin" placeholder="AIza…" autocomplete="off" spellcheck="false" value="${esc(GEM.key)}" data-enter="saveKey"><button class="btn primary" data-a="saveKey">${ui.keyBusy?'<span class="spinner"></span>':"Save"}</button></div>
    <p class="muted" style="font-size:12.5px">The key stays in this browser only. On the free tier, Google may use what you send to improve its products, so don't share private details in practice sessions.</p>
