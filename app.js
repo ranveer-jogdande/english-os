@@ -606,8 +606,12 @@ const GEM = {
 const AI = { state: GEM.key ? "on" : "off", get fn(){ return GEM.key ? true : null; } };
 const LEARNER = () => `The learner is ${S.name}, from Maharashtra, India (Marathi/Hindi background). Estimated level: ${S.levels?S.levels.overall:"not yet assessed"}. Accent preference: ${S.prefs.accent}. Be honest and specific; no fake praise. Respect Indian English: don't call a usage wrong if it is standard Indian English, but explain the international alternative.`;
 
-async function geminiRaw(model, body){
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEM.key)}`, {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(body)});
+async function geminiRaw(model, body, timeoutMs=45000){
+  const ctl = new AbortController(); const timer = setTimeout(()=>ctl.abort(), timeoutMs);
+  let r;
+  try{ r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEM.key)}`, {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(body), signal:ctl.signal}); }
+  catch(e){ clearTimeout(timer); throw ctl.signal.aborted ? {code:"timeout", message:`${model} took too long to answer`} : {code:"network", message:"Couldn't reach Google. Check your internet connection."}; }
+  clearTimeout(timer);
   let j={}; try{ j=await r.json(); }catch(e){}
   if(!r.ok){
     const msg=(j.error&&j.error.message)||r.statusText||"error"; const st=(j.error&&j.error.status)||"";
@@ -624,7 +628,7 @@ async function geminiRaw(model, body){
   if(!text) throw {code:"empty", message:c.finishReason||"Empty answer"};
   return text;
 }
-async function gemini({contents, system, json=false, quick=false, maxTokens=8192}){
+async function gemini({contents, system, json=false, quick=false, maxTokens=8192, timeout=45000, priority=false, maxModels=5}){
   if(!GEM.key) throw {code:"no_ai", message:"Add your free Gemini key in Settings."};
   const body = {contents, generationConfig:{maxOutputTokens:maxTokens, temperature: json?0.4:0.9}};
   if(json) body.generationConfig.response_mime_type="application/json";
@@ -633,43 +637,45 @@ async function gemini({contents, system, json=false, quick=false, maxTokens=8192
   const run = async () => {
     const gap = Date.now()-GEM.last; if(gap<1200) await new Promise(r=>setTimeout(r,1200-gap));
     const pref = quick ? GEM.workingQuick : GEM.working;
-    const list = [...new Set([pref, ...(quick?GEM.quick:GEM.models)].filter(Boolean))];
+    const list = [...new Set([pref, ...(quick?GEM.quick:GEM.models)].filter(Boolean))].slice(0,maxModels);
     let lastErr=null;
     for(const m of list){
       for(let attempt=0; attempt<2; attempt++){
         try{
           GEM.last=Date.now();
-          const t = await geminiRaw(m, body);
+          const t = await geminiRaw(m, body, timeout);
           if(quick) GEM.workingQuick=m; else if(GEM.working!==m){ GEM.working=m; lsSet(MODEL_LS,m); }
           GEM.lastError=""; AI.state="on"; return t;
         }catch(e){
           lastErr=e;
           if(e.code==="rate_limited" && attempt===0 && e.wait<=20){ toast(`Free-tier limit reached; retrying in ${e.wait}s…`); await new Promise(r=>setTimeout(r,e.wait*1000)); continue; }
-          if(e.code==="overloaded" && attempt===0){ await new Promise(r=>setTimeout(r,1500)); continue; }
+          if(e.code==="network") { lastErr=e; break; }
           break;
         }
       }
-      if(lastErr && !["model_unavailable","rate_limited","forbidden","overloaded","http_500","http_502","http_503","empty"].includes(lastErr.code)) break;
+      if(lastErr && !["model_unavailable","rate_limited","forbidden","overloaded","timeout","http_500","http_502","http_503","empty"].includes(lastErr.code)) break;
+      await new Promise(r=>setTimeout(r,600));
     }
     GEM.lastError = lastErr ? lastErr.message : "";
     if(lastErr && lastErr.code==="bad_key"){ AI.state="error"; paintStatus(); }
     throw lastErr || {code:"failed"};
   };
+  if(priority) return run();   // e.g. the key test: don't wait behind long requests
   const p = GEM.queue.then(run, run); GEM.queue = p.catch(()=>{}); return p;
 }
 const toContents = input => (typeof input==="string" ? [{role:"user",content:input}] : input).map(m=>({role:m.role==="assistant"?"model":"user", parts:[{text:m.content}]}));
 async function aiText(input, opts={}){ return (await gemini({contents:toContents(input), quick:opts.modelTier==="quick"})).trim(); }
 function parseJSON(t){ t=String(t).trim().replace(/^```(?:json)?\s*/i,"").replace(/```\s*$/,""); const a=t.indexOf("{"), b=t.lastIndexOf("}"); if(a<0||b<0) throw {code:"bad_json"}; return JSON.parse(t.slice(a,b+1)); }
-async function aiJSON(prompt, tier="default"){ return parseJSON(await gemini({contents:toContents(prompt), json:true, quick:tier==="quick", system:"Reply with exactly one valid JSON object and nothing else."})); }
+async function aiJSON(prompt, tier="default", opts={}){ return parseJSON(await gemini(Object.assign({contents:toContents(prompt), json:true, quick:tier==="quick", timeout:60000, system:"Reply with exactly one valid JSON object and nothing else."}, opts))); }
 async function aiAudioJSON(prompt, wavBase64){
-  const t = await gemini({contents:[{role:"user", parts:[{inline_data:{mime_type:"audio/wav", data:wavBase64}}, {text:prompt}]}], json:true, system:"Reply with exactly one valid JSON object and nothing else."});
+  const t = await gemini({contents:[{role:"user", parts:[{inline_data:{mime_type:"audio/wav", data:wavBase64}}, {text:prompt}]}], json:true, timeout:90000, system:"Reply with exactly one valid JSON object and nothing else."});
   return parseJSON(t);
 }
 async function setKey(k){
   k=String(k||"").trim(); GEM.key=k; lsSet(KEY_LS,k); GEM.working=""; lsSet(MODEL_LS,"");
   if(!k){ AI.state="off"; paintStatus(); render(); return false; }
-  try{ await gemini({contents:toContents("Reply with the single word: ready"), maxTokens:256}); AI.state="on"; toast(`Connected to ${GEM.working}.`); Daily.failed=null; setTimeout(()=>ensureDaily(),300); }
-  catch(e){ AI.state = e.code==="bad_key"?"error":"on"; toast(e.code==="bad_key"?e.message:e.code==="overloaded"?"Key saved. Google's free models are busy right now; the app will retry automatically when you practise.":e.code==="rate_limited"?"Key saved. Google says the free limit is reached right now; try again in a minute.":"Key saved, but the test failed: "+(e.message||e.code).slice(0,120)); }
+  try{ await gemini({contents:toContents("Reply with the single word: ready"), maxTokens:2048, timeout:15000, priority:true, maxModels:4}); AI.state="on"; toast(`Connected to ${GEM.working}.`); Daily.failed=null; setTimeout(()=>ensureDaily(),300); }
+  catch(e){ AI.state = e.code==="bad_key"?"error":"on"; toast(e.code==="bad_key"?e.message:e.code==="overloaded"?"Key saved. Google's free models are busy right now; the app will retry automatically when you practise.":e.code==="rate_limited"?"Key saved. Google says the free limit is reached right now; try again in a minute.":e.code==="timeout"?"Key saved. Google is slow to answer right now; the app will keep trying when you practise.":e.code==="network"?"Key saved, but Google couldn't be reached. Check your internet connection.":"Key saved, but the test failed: "+(e.message||e.code).slice(0,120)); }
   paintStatus(); render(); return AI.state==="on";
 }
 function initServices(){ AI.state = GEM.key ? "on" : "off"; paintStatus(); }
@@ -1134,7 +1140,7 @@ async function genWords(n){
   const j = await aiJSON(`You choose daily vocabulary for an English speaking coach app. ${profileBrief()}
 Pick exactly ${n} NEW high-value words or phrasal verbs for today, around level ${lvl} (one may be a level above). They must be useful in real spoken conversation and, where relevant, at work; connect at least two to the learner's interests. No rare or literary words. Mix parts of speech.
 Do NOT use any of these (already learned): ${known.join(", ")}.
-Return ONLY JSON: {"words":[{"w":"lowercase word or phrase","ipa":"/IPA/","say":"simple respelling with stressed syllable in CAPS","pos":"part of speech","lvl":"CEFR level","meaning":"simple one-sentence meaning","hi":"Hindi meaning in Devanagari","mr":"Marathi meaning in Devanagari","ex":["3 natural example sentences, at least one about Indian life or the learner's interests"],"coll":["3-4 common collocations"],"syn":["2-3 synonyms"],"ant":["0-2 opposites"],"mist":"one common mistake Indian learners make with it, and the fix","reg":"formal/casual usage note","convo":[["A","short line"],["B","short reply using the word"]],"workplace":"a speaking task: 'Describe/Explain ... ' that makes them use the word","wrong":["2 sentences that use the word INCORRECTLY (wrong meaning or wrong grammar) for a recognition quiz"]}]}`);
+Return ONLY JSON: {"words":[{"w":"lowercase word or phrase","ipa":"/IPA/","say":"simple respelling with stressed syllable in CAPS","pos":"part of speech","lvl":"CEFR level","meaning":"simple one-sentence meaning","hi":"Hindi meaning in Devanagari","mr":"Marathi meaning in Devanagari","ex":["3 natural example sentences, at least one about Indian life or the learner's interests"],"coll":["3-4 common collocations"],"syn":["2-3 synonyms"],"ant":["0-2 opposites"],"mist":"one common mistake Indian learners make with it, and the fix","reg":"formal/casual usage note","convo":[["A","short line"],["B","short reply using the word"]],"workplace":"a speaking task: 'Describe/Explain ... ' that makes them use the word","wrong":["2 sentences that use the word INCORRECTLY (wrong meaning or wrong grammar) for a recognition quiz"]}]}`, "default", {timeout:120000, maxModels:3, priority:true});
   const out=[];
   for(const x of (j.words||[])){
     if(!x||!x.w||!x.meaning||!Array.isArray(x.ex)||x.ex.length<2) continue;
@@ -1168,7 +1174,7 @@ Return ONLY JSON:
    "qs":[{"k":"Main idea|Detail|Speaker intention|Tone|Inference|Vocabulary","q":"question","o":["4 options"],"a":index_of_correct}] (exactly 4, different k values)},
  "shadowing":{"title":"short title","type":"Casual conversation|Workplace|Interview|Presentation|Travel|Business|Debate|Movie-style","text":"40-70 words of natural speech split into breath groups with ' | ' and the stressed words wrapped in *asterisks*","tips":["3 short tips on rhythm, linking, stress or intonation for THIS passage"]},
  "translate":{"hi":"a short everyday Hindi sentence in Roman script","mr":"the same in Marathi Roman script","en":"its natural English"},
- "roleplay":{"name":"a person's name and role","desc":"their personality","scene":"the situation in one sentence"}}`);
+ "roleplay":{"name":"a person's name and role","desc":"their personality","scene":"the situation in one sentence"}}`, "default", {timeout:120000, maxModels:3, priority:true});
   const p = {date:today(), gt};
   if(Array.isArray(j.free_prompts)) p.free_prompts = j.free_prompts.filter(x=>x&&x.prompt).slice(0,6);
   ["story_prompt","debate_motion","presentation_topic","fluency_topic"].forEach(k=>{ if(typeof j[k]==="string" && j[k].length>8) p[k]=j[k]; });
