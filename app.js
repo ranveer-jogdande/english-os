@@ -1112,7 +1112,8 @@ function checkAch(){
    Every day Gemini writes fresh material for this learner: new words, prompts, a listening clip,
    a shadowing passage and grammar items. Everything is cached for the day, so it costs 2 requests a day.
    Without a key (or if Google is unavailable) the built-in library is used instead. */
-const Daily = { running:false, failed:null, msg:"" };
+const APP_VERSION = "1.3 (27 Oct)";
+const Daily = { running:false, failed:null, msg:"", started:0, run:0 };
 const dp = () => (S.daily && S.daily[today()]) || null;
 
 function hydrateContent(){
@@ -1204,22 +1205,30 @@ async function ensureDaily(force){
   const needWords = !S.dayWords[t] && Object.keys(S.dayWords).length>0;
   const needPack = !dp();
   if(!needWords && !needPack) return;
-  Daily.running=true; Daily.msg=""; repaintForDaily();
+  Daily.running=true; Daily.msg=""; Daily.started=Date.now(); const myRun=++Daily.run; repaintForDaily();
+  const tick=setInterval(()=>{ if(!Daily.running||Daily.run!==myRun){ clearInterval(tick); return; } document.querySelectorAll(".daily-t").forEach(x=>x.textContent=Math.round((Date.now()-Daily.started)/1000)+"s"); if(Date.now()-Daily.started>150000) skipDaily("Google took too long today."); },1000);
   try{
-    if(needWords){ const n = dueWords().length>8 ? 3 : 5; S.dayWords[t] = await genWords(n); save(); repaintForDaily(); }
-    if(needPack){ const p=await genPack(); if(!p.listening && !p.shadowing && !(p.free_prompts&&p.free_prompts.length)) throw {code:"bad_pack"}; S.daily ||= {}; S.daily[t]=p; const ks=Object.keys(S.daily).sort(); ks.slice(0,Math.max(0,ks.length-3)).forEach(k=>delete S.daily[k]); hydrateContent(); if(!D().blocks.length) buildPlan(true); save(); }
+    if(needWords){ const n = dueWords().length>8 ? 3 : 5; const ws = await genWords(n); if(Daily.run!==myRun) return; S.dayWords[t]=ws; save(); repaintForDaily(); }
+    if(needPack){ const p=await genPack(); if(Daily.run!==myRun) return; if(!p.listening && !p.shadowing && !(p.free_prompts&&p.free_prompts.length)) throw {code:"bad_pack"}; S.daily ||= {}; S.daily[t]=p; const ks=Object.keys(S.daily).sort(); ks.slice(0,Math.max(0,ks.length-3)).forEach(k=>delete S.daily[k]); hydrateContent(); if(!D().blocks.length) buildPlan(true); save(); }
   }catch(e){
-    Daily.failed=t; Daily.msg = e.code==="overloaded"?"Google's free models are busy right now. Tap Try again in a few minutes.":e.code==="rate_limited"?"Google's free limit is reached right now; using the built-in library today.":"Couldn't create today's new content; using the built-in library.";
+    if(Daily.run!==myRun) return;
+    Daily.failed=t; Daily.err = (e&&(e.message||e.code))||"unknown"; Daily.msg = e.code==="overloaded"?"Google's free models are busy right now. Tap Try again in a few minutes.":e.code==="rate_limited"?"Google's free limit is reached right now; using the built-in library today.":"Couldn't create today's new content; using the built-in library.";
     if(needWords && !S.dayWords[t]){ const pool=WORDS.filter(x=>!V(x.w).introduced); S.dayWords[t]=pool.slice(0,5).map(x=>x.w); save(); }
   }
-  Daily.running=false; repaintForDaily();
+  clearInterval(tick); Daily.running=false; repaintForDaily();
+}
+/* Give up on generation for today and use the built-in library (can retry later) */
+function skipDaily(reason){
+  const t=today(); Daily.run++; Daily.running=false; Daily.failed=t; Daily.msg=(reason?reason+" ":"")+"Using the built-in library for now.";
+  if(!S.dayWords[t] && Object.keys(S.dayWords).length>0){ const pool=WORDS.filter(x=>!V(x.w).introduced); S.dayWords[t]=pool.slice(0,5).map(x=>x.w); save(); }
+  render();
 }
 function repaintForDaily(){
   // only redraw screens that show daily content and don't hold typing in progress
   const a=document.activeElement; const typing = a && /TEXTAREA|INPUT/.test(a.tagName) && a.value;
   if(!typing && !Voice.active && !Voice.busy && (["home","today"].includes(ui.route) || (ui.route==="vocabulary" && (!ui.v||ui.v.tab==="today") && !(ui.v&&ui.v.fb)) || (["shadowing","listening"].includes(ui.route) && !ui.sh && !ui.ls))) render();
 }
-const dailyChip = () => Daily.running ? `<span class="chip acc"><span class="spinner" style="width:12px;height:12px;border-width:2px"></span> Writing today's content…</span>` : dp() ? `<span class="chip good">Fresh today</span>` : "";
+const dailyChip = () => Daily.running ? `<span class="chip acc"><span class="spinner" style="width:12px;height:12px;border-width:2px"></span> Writing today's content… <span class="daily-t mono">0s</span></span>` : dp() ? `<span class="chip good">Fresh today</span>` : "";
 
 /* Grammar items: today's generated ones first, then the built-in set */
 function prItems(id){ const p=dp(); const gen = p&&p.grammar&&p.grammar.id===id ? p.grammar.items.map(([q,a])=>[q,a]) : []; return [...gen, ...TMAP[id].pr]; }
@@ -1337,7 +1346,7 @@ function renderLayer(){
 function statusHTML(){
   const ai = AI.state==="on"?`<span><i class="status-dot on"></i>AI coach on (Gemini, free)</span>`: AI.state==="error"?`<span><i class="status-dot off"></i>Gemini key not working</span>`:`<span><i class="status-dot off"></i>Add your free AI key</span>`;
   const sp = !Mic.supported?`<span><i class="status-dot off"></i>Microphone not available here</span>`:Voice.blocked?`<span><i class="status-dot off"></i>Microphone blocked</span>`:`<span><i class="status-dot on"></i>Microphone ready</span>`;
-  const st = `<span><i class="status-dot on"></i>Saved in this browser</span>`;
+  const st = `<span><i class="status-dot on"></i>Saved in this browser</span><span class="muted mono" style="font-size:11px">Version ${APP_VERSION}</span>`;
   const lv=levelOf(S.xp);
   return `<div class="row between"><span class="chip warm">${ic("flame")} ${streak()} day streak</span><span class="chip">Lv ${lv.l}</span></div><div class="bar" title="${lv.toNext} XP to next level"><i style="width:${Math.round(lv.pct*100)}%"></i></div>${ai}${sp}${st}`;
 }
@@ -1443,7 +1452,9 @@ function keySetupHTML(compact){
    <p class="muted" style="font-size:12.5px">The key stays in this browser only. On the free tier, Google may use what you send to improve its products, so don't share private details in practice sessions.</p>
   </section>`;
 }
-A.saveKey = async () => { const v=(($("#keyin")||{}).value||"").trim(); if(!v){ await setKey(""); return; } ui.keyBusy=true; render(); await setKey(v); ui.keyBusy=false; render(); };
+A.saveKey = async () => { const v=(($("#keyin")||{}).value||"").trim(); if(!v){ await setKey(""); return; } ui.keyBusy=true; render();
+  const watchdog = setTimeout(()=>{ if(ui.keyBusy){ ui.keyBusy=false; toast("Key saved. Google didn't answer the test in time; use Settings → Test connection to see why."); render(); } }, 30000);
+  try{ await setKey(v); }finally{ clearTimeout(watchdog); ui.keyBusy=false; render(); } };
 VIEWS.home = () => {
   const d=D(), plan=buildPlan(), f=focusToday(), lv=S.levels;
   const vt = todaysWords(); const vDone = vt.filter(w=>STAT_IDX(V(w).status)>=3).length;
@@ -1485,7 +1496,7 @@ VIEWS.home = () => {
     <button class="cta" data-a="goQuiz" data-v="today"><div class="ic">${ic("quizzes")}</div><b>Practice</b><span>13-question mixed quiz</span></button>
     <button class="cta" data-a="goVocab" data-v="review"><div class="ic">${ic("replay")}</div><b>Review</b><span>${dueWords().length} words due · ${recurringErrors().length} recurring mistakes</span></button>
   </div>
-  ${!GEM.key?keySetupHTML():""}`;
+  ${!GEM.key?keySetupHTML():(Daily.running||(!dp()&&Daily.msg))?dailyHTML():""}`;
 };
 A.goQuiz = v => go("quizzes", v);
 A.goVocab = v => go("vocabulary", v);
@@ -1501,8 +1512,8 @@ VIEWS.today = () => {
 function dailyHTML(){
   const p=dp();
   if(!GEM.key) return `<div class="note">${ic("info")}<span>Add your free Gemini key in Settings and every day gets new words, prompts, a listening clip, a shadowing passage and grammar practice written for you. Until then the built-in library is used.</span></div>`;
-  if(Daily.running) return `<div class="note acc"><span class="spinner"></span><span>Writing today's words, prompts, listening clip and shadowing passage for you…</span></div>`;
-  if(!p) return `<div class="note warn">${ic("info")}<span>${esc(Daily.msg||"Today's new content isn't ready.")}</span><button class="btn sm" style="margin-left:auto" data-a="dailyRetry">Try again</button></div>`;
+  if(Daily.running) return `<div class="note acc"><span class="spinner"></span><span>Writing today's words, prompts, listening clip and shadowing passage for you… <span class="daily-t mono">0s</span><br><span class="muted" style="font-size:12.5px">This usually takes under a minute. You can start practising meanwhile.</span></span><button class="btn sm" style="margin-left:auto" data-a="skipDaily">Skip for today</button></div>`;
+  if(!p) return `<div class="note warn">${ic("info")}<span>${esc(Daily.msg||"Today's new content isn't ready.")}${Daily.err?`<br><span class="muted mono" style="font-size:12px">${esc(String(Daily.err).slice(0,160))}</span>`:""}</span><button class="btn sm" style="margin-left:auto" data-a="dailyRetry">Try again</button></div>`;
   const ws=todaysWords();
   return `<section class="card stack"><div class="row between"><h3>New for you today</h3><span class="chip good">Written for you today</span></div>
    <dl class="kv">
@@ -1515,6 +1526,7 @@ function dailyHTML(){
     ${p.roleplay?`<dt>Role-play</dt><dd>${esc(p.roleplay.name)}: ${esc(p.roleplay.scene)}</dd>`:""}
    </dl></section>`;
 }
+A.skipDaily = () => skipDaily("");
 A.dailyRetry = () => { Daily.failed=null; ensureDaily(true); render(); };
 A.goListen = id => { go("listening"); A.lsOpen(id); };
 A.goShadow = id => { go("shadowing"); A.shOpen(id); };
@@ -2575,6 +2587,11 @@ VIEWS.settings = () => {
    <div class="field"><span class="lbl">Topics of interest</span><div class="pillset">${TOPIC_LIST.map(t=>`<button class="pill ${S.profile.topics.includes(t)?"on":""}" data-a="setTopic" data-v="${t}">${t}</button>`).join("")}</div></div>
   </section>
   ${keySetupHTML(true)}
+  <section class="card stack"><div class="row between"><h3>Connection test</h3><span class="muted mono" style="font-size:12px">App version ${APP_VERSION}</span></div>
+   <p class="muted">Checks each free Gemini model with your key and shows exactly what Google answers.</p>
+   <div class="row"><button class="btn" data-a="connTest" ${GEM.key&&!ui.ct?.running?"":"disabled"}>${ui.ct?.running?'<span class="spinner"></span> Testing…':"Test connection"}</button></div>
+   ${ui.ct&&ui.ct.rows.length?`<div class="scroll-x"><table class="t"><thead><tr><th>Model</th><th>Result</th><th>Time</th></tr></thead><tbody>${ui.ct.rows.map(r=>`<tr><td class="mono">${esc(r.m)}</td><td>${r.ok?`<span class="chip good">Works</span>`:r.pending?'<span class="spinner"></span>':`<span class="chip bad">${esc(r.code||"error")}</span> <span class="muted" style="font-size:12.5px">${esc(String(r.msg||"").slice(0,140))}</span>`}</td><td class="mono">${r.sec!=null?r.sec+"s":""}</td></tr>`).join("")}</tbody></table></div>`:""}
+  </section>
   <section class="card stack s18"><h3>Learning</h3><div class="grid g3">
    <div class="field"><label for="set-target">Daily target</label>${sel("target",[[15,"15 min"],[30,"30 min"],[45,"45 min"],[60,"60 min"],[90,"90 min"]])}</div>
    <div class="field"><label for="set-difficulty">Difficulty</label>${sel("difficulty",[["auto","Adaptive (recommended)"],["easier","A bit easier"],["harder","A bit harder"]])}</div>
@@ -2599,6 +2616,20 @@ A.saveName = () => { const v=($("#set-name")||{}).value; if(v&&v.trim()){ S.name
 document.addEventListener("focusout", e=>{ if(e.target.id==="set-name") A.saveName(); });
 A.setTopic = t => { const a=S.profile.topics; const i=a.indexOf(t); i>=0?a.splice(i,1):a.push(t); save(); render(); };
 A.exportData = () => exportData();
+A.connTest = async () => {
+  if(!GEM.key) return; ui.ct={running:true, rows:[]}; render();
+  for(const m of [...new Set([...GEM.models, ...GEM.quick])]){
+    const row={m, pending:true}; ui.ct.rows.push(row); if(ui.route==="settings") render();
+    const t0=Date.now();
+    try{ await geminiRaw(m, {contents:[{role:"user",parts:[{text:"Reply with the single word: ready"}]}], generationConfig:{maxOutputTokens:2048}}, 20000); row.ok=true; if(!GEM.working){ GEM.working=m; lsSet(MODEL_LS,m); } AI.state="on"; }
+    catch(e){ row.code=e.code; row.msg=e.message; }
+    row.pending=false; row.sec=((Date.now()-t0)/1000).toFixed(1);
+  }
+  ui.ct.running=false; const good=ui.ct.rows.find(r=>r.ok);
+  if(good){ GEM.working=good.m; lsSet(MODEL_LS,good.m); AI.state="on"; }
+  toast(good?`Working model: ${good.m}`:"No model answered. See the table for Google's messages.");
+  paintStatus(); if(ui.route==="settings") render();
+};
 A.forgetKey = async () => { await setKey(""); toast("Key removed from this device."); };
 document.addEventListener("change", e=>{ if(e.target.id==="importfile" && e.target.files[0]) importData(e.target.files[0]); });
 A.redoDiag = () => { startDiag("initial"); render(); };
