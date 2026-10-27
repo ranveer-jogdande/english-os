@@ -1112,7 +1112,7 @@ function checkAch(){
    Every day Gemini writes fresh material for this learner: new words, prompts, a listening clip,
    a shadowing passage and grammar items. Everything is cached for the day, so it costs 2 requests a day.
    Without a key (or if Google is unavailable) the built-in library is used instead. */
-const APP_VERSION = "1.4 (27 Oct)";
+const APP_VERSION = "1.5 (27 Oct)";
 const Daily = { running:false, failed:null, msg:"", started:0, run:0 };
 const dp = () => (S.daily && S.daily[today()]) || null;
 
@@ -1517,7 +1517,7 @@ function dailyHTML(){
   const ws=todaysWords();
   return `<section class="card stack"><div class="row between"><h3>New for you today</h3><span class="chip good">Written for you today</span></div>
    <dl class="kv">
-    <dt>Words</dt><dd>${ws.map(w=>`<b>${esc(w)}</b>`).join(", ")||"—"}</dd>
+    <dt>Words</dt><dd>${ws.map(w=>`<b>${esc(w)}</b>`).join(", ")||"—"}${ws.some(w=>isStarter(w)&&STAT_IDX(V(w).status)<3)?` <button class="linkbtn" data-a="goSwap">Swap for words picked for you</button>`:""}</dd>
     ${p.free_prompts&&p.free_prompts[0]?`<dt>Speaking</dt><dd>${esc(p.free_prompts[0].prompt)}</dd>`:""}
     ${p.grammar?`<dt>Grammar</dt><dd>${p.grammar.items.length} new ${esc(TMAP[p.grammar.id].name)} items</dd>`:""}
     ${p.listening?`<dt>Listening</dt><dd><button class="linkbtn" data-a="goListen" data-v="${p.listening.id}">${esc(p.listening.title.replace("Today · ",""))}</button></dd>`:""}
@@ -1528,6 +1528,7 @@ function dailyHTML(){
 }
 A.skipDaily = () => skipDaily("");
 A.dailyRetry = () => { Daily.failed=null; ensureDaily(true); render(); };
+A.goSwap = () => { go("vocabulary","today"); A.moreWords("replace"); };
 A.goListen = id => { go("listening"); A.lsOpen(id); };
 A.goShadow = id => { go("shadowing"); A.shOpen(id); };
 function planWhy(){
@@ -1763,21 +1764,29 @@ VIEWS.vocabulary = () => {
 };
 A.vTab = k => { ui.v={tab:k,i:0}; Timer.clear(); render(); };
 
+const STARTER = ["implement","hesitate","convey","reliable","eventually"];
+const isStarter = w => STARTER.includes(w) && !(S.wordBank&&S.wordBank[w]);
 function wordGenButton(list){
   if(!GEM.key) return "";
-  const busy=ui.wgen;
-  const untouched = list.every(w=>STAT_IDX(V(w).status)<=2) && !(S.wordBank&&list.some(w=>S.wordBank[w]));
-  if(list.length>=10 && !untouched) return "";
-  return `<button class="btn sm" data-a="moreWords" data-v="${untouched?"replace":"add"}" ${busy?"disabled":""}>${busy?'<span class="spinner"></span> Picking words for you…':untouched?`${ic("spark")} Swap for words picked for me`:`${ic("spark")} 5 more words`}</button>`;
+  const busy=ui.wgen; const starters=list.filter(isStarter);
+  if(starters.some(w=>STAT_IDX(V(w).status)<3)){
+    const keep=starters.filter(w=>STAT_IDX(V(w).status)>=3);
+    return `<div class="note acc" style="align-items:center">${ic("spark")}<span><b>These are the 5 starter words.</b> Swap them for words chosen for your level and interests.${keep.length?` Words you've already practised (${keep.join(", ")}) stay.`:""}</span><button class="btn primary sm" style="margin-left:auto" data-a="moreWords" data-v="replace" ${busy?"disabled":""}>${busy?'<span class="spinner"></span> Picking words…':"Swap words"}</button></div>`;
+  }
+  if(list.length>=10) return "";
+  return `<div class="row" style="justify-content:flex-end"><button class="btn sm" data-a="moreWords" data-v="add" ${busy?"disabled":""}>${busy?'<span class="spinner"></span> Picking words for you…':`${ic("spark")} 5 more words`}</button></div>`;
 }
 A.moreWords = async mode => {
   if(ui.wgen) return; ui.wgen=true; render();
   try{
     const ws = await genWords(5);
     const t=today();
-    if(mode==="replace"){ (S.dayWords[t]||[]).forEach(w=>{ const v=S.vocab[w]; if(v && STAT_IDX(v.status)<=2){ delete S.vocab[w]; S.vocabOrder=S.vocabOrder.filter(x=>x!==w); } }); S.dayWords[t]=ws; }
+    if(mode==="replace"){
+      const cur=S.dayWords[t]||[]; const keep=cur.filter(w=>!isStarter(w) || STAT_IDX(V(w).status)>=3);
+      cur.filter(w=>!keep.includes(w)).forEach(w=>{ delete S.vocab[w]; S.vocabOrder=S.vocabOrder.filter(x=>x!==w); });
+      S.dayWords[t]=[...keep, ...ws].slice(0, Math.max(5, keep.length+ws.length)); }
     else S.dayWords[t]=[...(S.dayWords[t]||[]), ...ws];
-    ui.v.i = mode==="replace" ? 0 : (S.dayWords[t].length-ws.length); ui.v.step=0; ui.v.fb=null;
+    ui.v.i = S.dayWords[t].indexOf(ws[0]); ui.v.step=0; ui.v.fb=null;
     save(); toast(`New words: ${ws.join(", ")}`);
   }catch(e){ toast(e.code==="rate_limited"?"Google's free limit is reached; try again in a minute.":e.code==="overloaded"||e.code==="timeout"?"Google's free models are busy; try again in a minute.":"Couldn't get new words: "+String(e.message||e.code).slice(0,100)); }
   ui.wgen=false; render();
@@ -1789,7 +1798,7 @@ function vocabToday(){
   introduceWord(w.w); save();
   const st = V(w.w);
   const fb = v.fb && v.fb.w===w.w ? v.fb : null;
-  return `<div class="row between" style="gap:10px"><div class="word-dots" style="flex-wrap:wrap">${list.map((x,i)=>`<button class="${i===v.i?"on":""} ${STAT_IDX(V(x).status)>=3&&i!==v.i?"dn":""}" data-a="vGo" data-v="${i}">${STAT_IDX(V(x).status)>=3?"✓ ":""}${esc(x)}</button>`).join("")}</div>${wordGenButton(list)}</div>
+  return `${wordGenButton(list)}<div class="word-dots" style="flex-wrap:wrap">${list.map((x,i)=>`<button class="${i===v.i?"on":""} ${STAT_IDX(V(x).status)>=3&&i!==v.i?"dn":""}" data-a="vGo" data-v="${i}">${STAT_IDX(V(x).status)>=3?"✓ ":""}${esc(x)}</button>`).join("")}</div>
   <section class="card stack s18 fade-in">
     <div class="row between">
       <div class="word-head"><span class="word-title">${esc(w.w)}</span><span class="ipa">${esc(w.ipa)} · ${esc(w.say)}</span><button class="btn sm ghost" data-a="say" data-v="${esc(w.w)}" aria-label="Hear it">${ic("play")}</button>${Speech.ok?`<button class="btn sm" data-a="wordDrill" data-v="${esc(w.w)}">${ic("mic")} Check my pronunciation</button>`:""}</div>
